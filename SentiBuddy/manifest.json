@@ -54,11 +54,13 @@
     },
   "host_permissions": [
     "https://management.azure.com/*",
-    "https://portal.azure.com/*"
+    "https://portal.azure.com/*",
+    "https://mto.security.microsoft.com/*",
+     "https://security.microsoft.com/*"
   ],
     "content_scripts": [
       {
-        "matches": ["https://portal.azure.com/*", "https://api.abuseipdb.com/*", "https://www.virustotal.com/*", "https://api11.scamalytics.com/*"],
+        "matches": ["https://mto.security.microsoft.com/*", "https://security.microsoft.com/*", "https://portal.azure.com/*", "https://api.abuseipdb.com/*", "https://www.virustotal.com/*", "https://api11.scamalytics.com/*"],
         "css": ["css/core.css"],
         "js": ["core.js", "scripts/timer-script.js", "scripts/stats.js"],
         "run_at": "document_end",
@@ -71,7 +73,7 @@
     "web_accessible_resources": [
         {
           "resources": [ "_favicon/*", "options.html", "popup.html"],
-          "matches": ["https://portal.azure.com/*","https://api.abuseipdb.com/*", "https://www.virustotal.com/*", "https://api11.scamalytics.com/*"],
+          "matches": ["https://mto.security.microsoft.com/*", "https://security.microsoft.com/*", "https://portal.azure.com/*","https://api.abuseipdb.com/*", "https://www.virustotal.com/*", "https://api11.scamalytics.com/*"],
           "extension_ids": ["*"]
         }
       ],
