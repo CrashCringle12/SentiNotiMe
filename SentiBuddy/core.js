@@ -218,8 +218,8 @@ var defaultQueue = function () {
 
       // Required fields for this row to be considered valid
       const severityEl = getCell(cellMap, "severity"); // key is usually "severity"
-      const titleEl = getCell(cellMap, "incidentName", "incident name", "Incident name");
-
+      const titleEl = getCell(cellMap, "name", "incidentName", "incident name", "Incident name");
+      console.log("Test Print2")
       if (!severityEl || !titleEl) {
         console.log("Nothing in Queue");
         return;
@@ -227,6 +227,7 @@ var defaultQueue = function () {
 
       var severity = severityEl.textContent.trim();
       var title = titleEl.textContent.trim();
+      console.log(title)
 
       // Workspace (optional)
       var workspace = getText(cellMap, "workspace");
@@ -274,7 +275,7 @@ var defaultQueue = function () {
         console.log(row.parentNode);
         console.log("Hiding " + client + " " + incID);
         console.log(row);
-        row.parentNode.removeChild(row);
+        row.parentNode.parentNode.parentNode.removeChild(row.parentNode.parentNode);
       }
 
       if (!initializing) {
@@ -462,7 +463,8 @@ chrome.runtime.onMessage.addListener(function (request) {
 
           // Required fields for this row to be considered valid
           const severityEl = getCell(cellMap, "severity"); // key is usually "severity"
-          const titleEl = getCell(cellMap, "incidentName", "incident name", "Incident name");
+          const titleEl = getCell(cellMap, "name", "incidentName", "incident name", "Incident name");
+          console.log("Test Print")
 
           if (!severityEl || !titleEl) {
             console.log("Nothing in Queue");
@@ -518,7 +520,7 @@ chrome.runtime.onMessage.addListener(function (request) {
             console.log(row.parentNode);
             console.log("Hiding " + client + " " + incID);
             console.log(row);
-            row.parentNode.removeChild(row);
+            row.parentNode.parentNode.parentNode.removeChild(row.parentNode.parentNode);
           }
 
           if (!initializing) {
