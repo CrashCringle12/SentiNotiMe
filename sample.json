@@ -1,4 +1,5 @@
 {
+    "incidentLookbackEndpoint": "https://your-org.example.com/api/incident-lookback",
     "tableData": {
         "schemas": {
             "data": {
@@ -72,6 +73,34 @@
                     {
                         "key": "location",
                         "displayName": "Location"
+                    }
+                ]
+            },
+            "incidents": {
+                "columns": [
+                    {
+                        "key": "title",
+                        "displayName": "Incident Title"
+                    },
+                    {
+                        "key": "client",
+                        "displayName": "Client"
+                    },
+                    {
+                        "key": "hoursWorked",
+                        "displayName": "Hours Worked"
+                    },
+                    {
+                        "key": "closedAt",
+                        "displayName": "Closed"
+                    },
+                    {
+                        "key": "link",
+                        "displayName": "Incident",
+                        "hyperlink": {
+                            "urlField": "link",
+                            "text": "Open"
+                        }
                     }
                 ]
             }

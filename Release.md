@@ -234,6 +234,7 @@ configuration.
     "onlyAlertOnLatest": { "type": "boolean" },
     "dashboardTitle": { "type": "string" },
     "dashboardLink": { "type": "string" },
+    "incidentLookbackEndpoint": { "type": "string" },
     "tableData": {
       "type": "object",
       "properties": {

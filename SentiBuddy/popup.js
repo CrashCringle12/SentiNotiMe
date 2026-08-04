@@ -26,6 +26,8 @@ let devData;
 let data;
 let clientTableSchema;
 let devTableSchema;
+let incidentLookbackEndpoint = '';
+let incidentTableSchemaFromConfig = null;
 const SAFE_URL_PROTOCOLS = ['https:'];
 
 function sanitizeUrl(url) {
@@ -238,6 +240,33 @@ function configureTableSchemas(tableDataConfig) {
   renderTableHeaders('devTableHead', devTableSchema);
 }
 
+function extractIncidentLookbackEndpoint(config) {
+  if (!config || typeof config !== 'object') return '';
+  const candidates = [
+    config.incidentLookbackEndpoint,
+    config['incident-lookback-endpoint'],
+    config.incidentLookbackUrl,
+    config['incident-lookback-url']
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+  return '';
+}
+
+function extractIncidentTableSchema(config) {
+  if (!config || typeof config !== 'object') return null;
+  const schemas = config.tableData?.schemas || config.schemas || {};
+  return schemas.incidents || schemas.incident || null;
+}
+
+function applyMasterConfig(config) {
+  incidentLookbackEndpoint = extractIncidentLookbackEndpoint(config);
+  incidentTableSchemaFromConfig = extractIncidentTableSchema(config);
+}
+
 var configDataURL = '';
 function loadConfigURL() {
   chrome.storage.local.get({
@@ -263,6 +292,7 @@ async function fetchClientData() {
       devData = getArrayOrEmpty(parsedCached?.tableData?.devData);
       data = getArrayOrEmpty(parsedCached?.tableData?.data);
       configureTableSchemas(parsedCached?.tableData);
+      applyMasterConfig(parsedCached);
     } else {
         try {        
           const response = await fetch(configDataURL); // Replace with actual URL
@@ -270,6 +300,7 @@ async function fetchClientData() {
           devData = getArrayOrEmpty(result?.tableData?.devData);
           data = getArrayOrEmpty(result?.tableData?.data);
           configureTableSchemas(result?.tableData);
+          applyMasterConfig(result);
 
         // Cache result
         localStorage.setItem(cacheKey, JSON.stringify(result));
@@ -355,13 +386,15 @@ function showTab(tab) {
   const sections = {
     client: "clientSection",
     queue: "queueSection",
-    development: "developmentSection"
+    development: "developmentSection",
+    incidents: "incidentsSection"
   };
 
   const buttons = {
     client: "clientBtn",
     queue: "queueBtn",
-    development: "developmentBtn"
+    development: "developmentBtn",
+    incidents: "incidentsBtn"
   };
 
   Object.keys(sections).forEach(key => {
@@ -395,7 +428,285 @@ document.getElementById("queueBtn").addEventListener("click", () => {
   showTab("queue");
 });
 
+document.getElementById("incidentsBtn").addEventListener("click", () => {
+  showTab("incidents");
+  refreshPortalEmail();
+});
 
+// --- Incident lookback tab -------------------------------------------------
+
+const INCIDENT_ARRAY_KEYS = ['incidents', 'rows', 'data', 'items', 'results'];
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const PORTAL_URL_PREFIX = 'https://portal.azure.com/';
+
+function setEmailHint(message, tone) {
+  const el = document.getElementById('lookbackEmailHint');
+  if (!el) return;
+  el.textContent = message || '';
+  el.classList.remove('is-success', 'is-error');
+  if (tone === 'success') el.classList.add('is-success');
+  if (tone === 'error') el.classList.add('is-error');
+}
+
+function setLookbackEmail(value, tone, hint) {
+  const input = document.getElementById('lookbackEmail');
+  if (!input) return;
+  input.value = value || '';
+  input.readOnly = true;
+  input.placeholder = value ? '' : 'Detecting from Azure portal...';
+  setEmailHint(hint || '', tone);
+}
+
+function requestPortalEmailFromTab(tabId) {
+  return new Promise((resolve) => {
+    try {
+      chrome.tabs.sendMessage(tabId, { type: 'get-portal-email' }, (response) => {
+        if (chrome.runtime.lastError) {
+          resolve({ ok: false, error: chrome.runtime.lastError.message });
+          return;
+        }
+        resolve(response || { ok: false, error: 'no-response' });
+      });
+    } catch (err) {
+      resolve({ ok: false, error: err?.message || 'send-failed' });
+    }
+  });
+}
+
+async function refreshPortalEmail() {
+  try {
+    const [tab] = await new Promise((resolve) => {
+      chrome.tabs.query({ active: true, currentWindow: true }, resolve);
+    });
+
+    if (!tab || !tab.id || !tab.url || !tab.url.startsWith(PORTAL_URL_PREFIX)) {
+      setLookbackEmail('', 'error', 'Failed to pull email. Open portal.azure.com and reopen this popup.');
+      return;
+    }
+
+    const response = await requestPortalEmailFromTab(tab.id);
+    if (response?.ok && EMAIL_PATTERN.test(response.email)) {
+      setLookbackEmail(response.email, 'success', `Auto-detected from Azure portal: ${response.email}`);
+    } else {
+      setLookbackEmail('', 'error', 'Failed to pull email. Open portal.azure.com and reopen this popup.');
+    }
+  } catch (err) {
+    console.error('Portal email lookup failed:', err);
+    setLookbackEmail('', 'error', 'Failed to pull email. Open portal.azure.com and reopen this popup.');
+  }
+}
+
+function getBrowserTimezone() {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  } catch {
+    return 'UTC';
+  }
+}
+
+function getSupportedTimezones() {
+  try {
+    if (typeof Intl.supportedValuesOf === 'function') {
+      const zones = Intl.supportedValuesOf('timeZone');
+      if (Array.isArray(zones) && zones.length) return zones;
+    }
+  } catch { /* fall through */ }
+  return [
+    'UTC', 'America/Los_Angeles', 'America/Denver', 'America/Chicago',
+    'America/New_York', 'America/Toronto', 'America/Sao_Paulo',
+    'Europe/London', 'Europe/Berlin', 'Europe/Madrid', 'Europe/Paris',
+    'Europe/Amsterdam', 'Europe/Athens', 'Africa/Johannesburg',
+    'Asia/Dubai', 'Asia/Kolkata', 'Asia/Singapore', 'Asia/Hong_Kong',
+    'Asia/Tokyo', 'Australia/Sydney', 'Pacific/Auckland'
+  ];
+}
+
+function populateTimezoneSelect() {
+  const select = document.getElementById('lookbackTimezone');
+  if (!select || select.dataset.populated === 'true') return;
+
+  const zones = getSupportedTimezones();
+  const browserZone = getBrowserTimezone();
+  const fragment = document.createDocumentFragment();
+
+  zones.forEach(zone => {
+    const option = document.createElement('option');
+    option.value = zone;
+    option.textContent = zone;
+    fragment.appendChild(option);
+  });
+
+  select.appendChild(fragment);
+  if (zones.includes(browserZone)) {
+    select.value = browserZone;
+  }
+  select.dataset.populated = 'true';
+}
+
+function setIncidentStatus(message, tone) {
+  const el = document.getElementById('incidentStatus');
+  if (!el) return;
+  el.textContent = message || '';
+  el.classList.remove('is-success', 'is-error');
+  if (tone === 'success') el.classList.add('is-success');
+  if (tone === 'error') el.classList.add('is-error');
+}
+
+function findIncidentRows(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (!payload || typeof payload !== 'object') return [];
+
+  for (const key of INCIDENT_ARRAY_KEYS) {
+    if (Array.isArray(payload[key])) return payload[key];
+  }
+  if (Array.isArray(payload?.tableData?.incidents)) return payload.tableData.incidents;
+  if (Array.isArray(payload?.tableData?.data)) return payload.tableData.data;
+  return [];
+}
+
+function findIncidentSchema(payload) {
+  if (!payload || typeof payload !== 'object') return null;
+  return payload.schema
+    || payload.schemas?.incidents
+    || payload.tableData?.schemas?.incidents
+    || incidentTableSchemaFromConfig
+    || null;
+}
+
+function renderIncidentResults(payload) {
+  const resultsEl = document.getElementById('incidentResults');
+  if (!resultsEl) return;
+
+  const rows = findIncidentRows(payload);
+  if (!rows.length) {
+    resultsEl.style.display = 'none';
+    return;
+  }
+
+  const columns = resolveTableSchema('incidents', rows, findIncidentSchema(payload));
+  renderTableHeaders('incidentTableHead', columns);
+  renderRows('incidentTableBody', rows, columns);
+  resultsEl.style.display = 'block';
+}
+
+function clearIncidentResults() {
+  const resultsEl = document.getElementById('incidentResults');
+  if (!resultsEl) return;
+  resultsEl.style.display = 'none';
+  const head = document.getElementById('incidentTableHead');
+  const body = document.getElementById('incidentTableBody');
+  if (head) head.innerHTML = '';
+  if (body) body.innerHTML = '';
+}
+
+async function submitIncidentLookback() {
+  const hoursInput = document.getElementById('lookbackHours');
+  const tzSelect = document.getElementById('lookbackTimezone');
+  const emailInput = document.getElementById('lookbackEmail');
+  const submitBtn = document.getElementById('submitLookback');
+  if (!hoursInput || !tzSelect || !emailInput) return;
+
+  const hours = Number(hoursInput.value);
+  const timezone = tzSelect.value;
+  const email = emailInput.value.trim();
+
+  if (!Number.isFinite(hours) || hours <= 0) {
+    setIncidentStatus('Enter a positive number of hours to look back.', 'error');
+    return;
+  }
+  if (!timezone) {
+    setIncidentStatus('Select a timezone.', 'error');
+    return;
+  }
+  if (!EMAIL_PATTERN.test(email)) {
+    setIncidentStatus('Failed to pull email. Open portal.azure.com in the active tab and reopen this popup.', 'error');
+    return;
+  }
+  if (!incidentLookbackEndpoint) {
+    setIncidentStatus('Incident lookback endpoint is not configured. Add "incidentLookbackEndpoint" to the master config.', 'error');
+    return;
+  }
+
+  let safeEndpoint;
+  try {
+    const parsed = new URL(incidentLookbackEndpoint);
+    if (parsed.protocol !== 'https:') {
+      setIncidentStatus('Incident lookback endpoint must be an https URL.', 'error');
+      return;
+    }
+    safeEndpoint = parsed.href;
+  } catch {
+    setIncidentStatus('Incident lookback endpoint is not a valid URL.', 'error');
+    return;
+  }
+
+  clearIncidentResults();
+  setIncidentStatus('Sending request...');
+  if (submitBtn && typeof submitBtn.setAttribute === 'function') {
+    submitBtn.setAttribute('disabled', 'true');
+  }
+
+  try {
+    const response = await fetch(safeEndpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify({
+        lookbackHours: hours,
+        timezone,
+        email
+      })
+    });
+
+    if (!response.ok) {
+      throw new Error(`Request failed with status ${response.status}`);
+    }
+
+    let payload = null;
+    const contentType = response.headers.get('content-type') || '';
+    if (contentType.includes('application/json')) {
+      try {
+        payload = await response.json();
+      } catch {
+        payload = null;
+      }
+    }
+
+    setIncidentStatus('Email will be sent shortly.', 'success');
+    if (payload) renderIncidentResults(payload);
+  } catch (error) {
+    console.error('Incident lookback request failed:', error);
+    setIncidentStatus(`Request failed: ${error?.message || 'unknown error'}`, 'error');
+  } finally {
+    if (submitBtn && typeof submitBtn.removeAttribute === 'function') {
+      submitBtn.removeAttribute('disabled');
+    }
+  }
+}
+
+function initIncidentLookbackTab() {
+  populateTimezoneSelect();
+
+  const submitBtn = document.getElementById('submitLookback');
+  if (submitBtn && !submitBtn.dataset.bound) {
+    submitBtn.dataset.bound = 'true';
+    submitBtn.addEventListener('click', () => {
+      submitIncidentLookback();
+    });
+  }
+
+  const hoursEl = document.getElementById('lookbackHours');
+  if (hoursEl && hoursEl.dataset.enterBound !== 'true') {
+    hoursEl.dataset.enterBound = 'true';
+    hoursEl.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        submitIncidentLookback();
+      }
+    });
+  }
+
+  refreshPortalEmail();
+}
 
 // Close modal when clicking outside of it
 window.addEventListener("click", (event) => {
@@ -698,6 +1009,8 @@ document.addEventListener('DOMContentLoaded', () => {
    chrome.storage.local.get({ lastPopupTab: 'client' }, (result) => {
         showTab(result.lastPopupTab);
     });
+
+  initIncidentLookbackTab();
     
     // Check the current state of the queue filtering
     chrome.runtime.sendMessage({ type: 'get-queue-state' }, (response) => {

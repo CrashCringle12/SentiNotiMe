@@ -23,6 +23,7 @@
             <button id="queueBtn">Operations</button>
             <button id="clientBtn" class="active">Client Info</button>
             <button id="developmentBtn">Development</button>
+            <button id="incidentsBtn">Incidents</button>
             <button id="themeToggleBtn" title="Toggle dark mode">🌙</button>
             <button id="settingsBtn" title="Open settings">⚙️</button>
         </div>
@@ -74,6 +75,39 @@
                     <thead id="devTableHead"></thead>
                     <tbody id="devTableBody"></tbody>
                 </table>
+            </div>
+        </div>
+
+        <div id="incidentsSection" class="section-card" style="display: none;">
+            <h2 class="section-subtitle">Incident Lookback</h2>
+            <p class="section-help">Request an email report of incidents worked over the selected window.</p>
+            <div class="form-grid">
+                <div class="form-group">
+                    <label for="lookbackHours">Lookback (hours)</label>
+                    <input type="number" id="lookbackHours" min="1" max="8760" step="1" value="24" />
+                </div>
+                <div class="form-group">
+                    <label for="lookbackTimezone">Timezone</label>
+                    <select id="lookbackTimezone"></select>
+                </div>
+                <div class="form-group form-group-wide">
+                    <label for="lookbackEmail">Email</label>
+                    <input type="email" id="lookbackEmail" placeholder="Detecting from Azure portal..."
+                        autocomplete="email" readonly />
+                    <div id="lookbackEmailHint" class="field-hint" role="status" aria-live="polite"></div>
+                </div>
+            </div>
+            <senti-button id="submitLookback" color="#0078D4" text-color="#FFFFFF" icon="\1F4E7" size="sm"
+                text="Send Report" tooltip="Request incident lookback report"></senti-button>
+            <div id="incidentStatus" class="incident-status" role="status" aria-live="polite"></div>
+            <div id="incidentResults" class="incident-results" style="display: none;">
+                <h2 class="section-subtitle">Incidents</h2>
+                <div class="incident-table-wrap">
+                    <table>
+                        <thead id="incidentTableHead"></thead>
+                        <tbody id="incidentTableBody"></tbody>
+                    </table>
+                </div>
             </div>
         </div>
     </div>

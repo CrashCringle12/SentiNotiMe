@@ -517,3 +517,46 @@ chrome.runtime.onMessage.addListener(function (request) {
   }
 });
 
+// Extract the signed-in Azure portal user's email so the popup's incident
+// lookback tab can pre-fill (and lock) the email field.
+function extractPortalEmail() {
+  const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+  const usernameEl = document.querySelector('.fxs-avatarmenu-username');
+  const usernameText = (usernameEl?.textContent || '').trim();
+  if (emailPattern.test(usernameText)) {
+    return usernameText;
+  }
+
+  const buttonEl = document.getElementById('fxs-avatarmenu-button')
+    || document.querySelector('.fxs-avatarmenu-header');
+  const attrs = [
+    buttonEl?.getAttribute('title'),
+    buttonEl?.getAttribute('aria-label')
+  ];
+  for (const attr of attrs) {
+    if (!attr) continue;
+    const match = attr.match(/Email:\s*([^\s<>"']+@[^\s<>"']+)/i);
+    if (match && emailPattern.test(match[1])) {
+      return match[1];
+    }
+  }
+
+  return '';
+}
+
+chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
+  if (request?.type !== 'get-portal-email') return;
+  try {
+    const email = extractPortalEmail();
+    if (email) {
+      sendResponse({ ok: true, email });
+    } else {
+      sendResponse({ ok: false, error: 'not-found' });
+    }
+  } catch (err) {
+    sendResponse({ ok: false, error: err?.message || 'unknown' });
+  }
+  return true;
+});
+
