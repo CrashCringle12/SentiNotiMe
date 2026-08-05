@@ -1,79 +1,101 @@
-// Unique ID for the className.
+// ============================================================================
+// SentiBuddy content script
+// ----------------------------------------------------------------------------
+// Runs on both Microsoft Sentinel (portal.azure.com) and Microsoft Defender
+// XDR (security.microsoft.com / mto.security.microsoft.com). The queue engine
+// (row scanning, filtering, notifications, disappearance detection) is shared;
+// each platform contributes a small adapter that knows how to find the queue
+// root, iterate rows, extract cell values, and remove a row.
+// ============================================================================
+
+// ---- Constants -------------------------------------------------------------
+
 const MOUSE_VISITED_CLASSNAME = 'crx_mouse_visited';
 const ELEMENT_CHANGED_CLASSNAME = 'elm_changed';
 
-let enabled = false;
-let observer, targetElem, DOMObserver, detailsElem;
-let targetParents = [];
+// ---- Platform detection ----------------------------------------------------
 
-// Previous Incident Clicked Data
+function detectPlatform() {
+  const host = location.hostname;
+  if (host === 'portal.azure.com') return 'sentinel';
+  if (host === 'security.microsoft.com' || host === 'mto.security.microsoft.com') return 'defender';
+  return null; // OSINT hosts (abuseipdb, virustotal, scamalytics) — queue engine no-ops
+}
+const PLATFORM = detectPlatform();
+
+// ---- Shared state ----------------------------------------------------------
+
+let enabled = false;
+let observer = null;
+let DOMObserver = null;
+let targetElem = null;
+let detailsElem = null;
+
+// Previous incident-clicked data (used to skip persisting unchanged details blade).
 let previousData = {};
 
+// In-memory incident tracker: keyed by (client + incID).
 let incidents = {};
-// Previous dom, that we want to track, so we can remove the previous styling.
-var prevDOM = null;
 
-var deletedElementsComponent = document.createElement('div');
+// Element under the mouse for the highlight overlay.
+let prevDOM = null;
+
+// Deletion tracker placeholder (kept from original code; not currently used).
+const deletedElementsComponent = document.createElement('div');
 deletedElementsComponent.classList.add('deleted-nav');
-var config = {};
-var doRemoveFromQueue = true;
+
+// Runtime config populated by loadConfig().
+let config = {};
+let doRemoveFromQueue = true;
+
+// Preserves original behavior — this is intentionally read before loadConfig's
+// async callback resolves, so it starts as `undefined` (falsy).
+let initializing = config.desktopNotifications;
+
+// ---- Config loading --------------------------------------------------------
+
 function loadConfig() {
   chrome.storage.local.get({
-    doRemoveFromFilteredFromQueue: true, // Default values if not set
+    doRemoveFromFilteredFromQueue: true,
     filterTitleRegexPatterns: [],
     filterTagsRegexPatterns: [],
     filterOwnerRegexPatterns: [],
     onlyAlertOnLatest: true,
     desktopNotifications: true
   }, (items) => {
-      config = {
-          doRemoveFromFilteredFromQueue: items.doRemoveFromFilteredFromQueue,
-          filterTitleRegexPatterns: items.filterTitleRegexPatterns,
-          filterTagsRegexPatterns: items.filterTagsRegexPatterns,
-          filterOwnerRegexPatterns: items.filterOwnerRegexPatterns,
-          onlyAlertOnLatest: items.onlyAlertOnLatest,
-          desktopNotifications: items.desktopNotifications
-      };
-      doRemoveFromQueue = config.doRemoveFromFilteredFromQueue;
-      console.log("Config loaded:", config);
-    });
+    config = {
+      doRemoveFromFilteredFromQueue: items.doRemoveFromFilteredFromQueue,
+      filterTitleRegexPatterns: items.filterTitleRegexPatterns,
+      filterTagsRegexPatterns: items.filterTagsRegexPatterns,
+      filterOwnerRegexPatterns: items.filterOwnerRegexPatterns,
+      onlyAlertOnLatest: items.onlyAlertOnLatest,
+      desktopNotifications: items.desktopNotifications
+    };
+    doRemoveFromQueue = config.doRemoveFromFilteredFromQueue;
+    console.log('Config loaded:', config);
+  });
 }
 loadConfig();
-var initializing = config.desktopNotifications
-function checkWordAgainstPatterns(title, patterns) {
-  for (let pattern of patterns) {
-    let regex = new RegExp(pattern);
-    if (regex.test(title)) {
-      // console.log(`{{ ${title} }}: matches pattern: ${pattern}`);
-      return true;
-    }
+
+// ---- Shared utilities ------------------------------------------------------
+
+function checkWordAgainstPatterns(text, patterns) {
+  for (const pattern of patterns) {
+    if (new RegExp(pattern).test(text)) return true;
   }
   return false;
 }
 
-
 function checkTagsAgainstPatterns(tags, patterns) {
-  //console.log("Testing Tags")
-  for (let pattern of patterns) {
-   // console.log(`"${pattern} Test`)
-    let regex = new RegExp(pattern);
-    // Splitting the string on the hyphen
-    var tagsSplit = tags.split(',');
-    // Check if the split array has at least two elements
-    //console.log("Length: " + tagsSplit.length)
-    if (tagsSplit.length > 1) {
-      for (let tag of tagsSplit) {
-        //console.log(`Testing ${tag} vs ${pattern}`)
-        if (regex.test(tag)) {
-          // console.log(`tag ${tag} : matches pattern: ${pattern}`);
-          return true;
-        }
+  for (const pattern of patterns) {
+    const regex = new RegExp(pattern);
+    const parts = tags.split(',');
+    if (parts.length > 1) {
+      for (const tag of parts) {
+        if (regex.test(tag)) return true;
       }
-    } else {
-      if (regex.test(tags)) {
-        // console.log(`Tags ${tags}  : matches pattern: ${pattern}`);
-        return true;
-      }
+    } else if (regex.test(tags)) {
+      return true;
     }
   }
   return false;
@@ -83,450 +105,472 @@ function getElementByXpath(path) {
   return document.evaluate(path, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
 }
 
-// Highlights the DOM element when the mouse moves
-var highlightFunc = function (e) {
-  var srcElement = e.srcElement;
+function highlightFunc(e) {
+  const src = e.srcElement;
+  if (prevDOM != null) prevDOM.classList.remove(MOUSE_VISITED_CLASSNAME);
+  src.classList.add(MOUSE_VISITED_CLASSNAME);
+  prevDOM = src;
+}
 
-  // For NPE checking, we check safely. We need to remove the class name
-  // Since we will be styling the new one after.
-  if (prevDOM != null) {
-    prevDOM.classList.remove(MOUSE_VISITED_CLASSNAME);
-  }
-  // Add a visited class name to the element. So we can style it.
-  srcElement.classList.add(MOUSE_VISITED_CLASSNAME);
+function addListeners() {
+  document.addEventListener('mousemove', highlightFunc, false);
+}
 
-  // The current element is now the previous. So we can remove the class
-  // during the next iteration.
-  prevDOM = srcElement;
+function removeListeners() {
+  document.removeEventListener('mousemove', highlightFunc, false);
+  if (prevDOM != null) prevDOM.classList.remove(MOUSE_VISITED_CLASSNAME);
 }
 
 function setSelectAllVisibility(visible) {
   const selectAll = document.querySelector('[aria-label="Select all items"]');
-  if (selectAll) {
-    console.log('Removings ' + visible)
-    selectAll.style.display = visible ? '' : 'none';
-  }
+  if (selectAll) selectAll.style.display = visible ? '' : 'none';
 }
 
-// getTargetParents stores the selected element hierarchy
-// so it can be compared later to highlight the last existing
-// parent.
-var getTargetParents = function (element) {
-  let p = [];
-  let parent = element.parentElement;
-  while (parent) {
-    p.push(parent);
-    parent = parent.parentElement;
-  }
-
-  return p
-}
-
-var checkAndUpdateIncident = function (client, incID, currentSeverity, owner, status) {
-  var incident = incidents[client+incID];
-  var eventType = "NONE"
+function checkAndUpdateIncident(client, incID, currentSeverity, owner, status) {
+  const incident = incidents[client + incID];
+  let eventType = 'NONE';
   if (incident) {
-    if (incident.owner != "Assign to me") {
-        if (incident.owner != owner) {
-          // console.log(incID + " Incident has a new Owner")
-          eventType = owner + " claimed";
-        } else if (incident.severity != currentSeverity) {
-          // console.log(incID + " Incident ID seen before but severity changed.");
-          eventType = incident.severity + " -->";
-        } else if (incident.status != status) {
-          eventType = "Updated";
-        } else {
-          //console.log("This incident " + incID + " has been seen before");
-        }
+    if (incident.owner != 'Assign to me') {
+      if (incident.owner != owner) {
+        eventType = owner + ' claimed';
+      } else if (incident.severity != currentSeverity) {
+        eventType = incident.severity + ' -->';
+      } else if (incident.status != status) {
+        eventType = 'Updated';
+      }
     }
   } else {
-    // New Incident ID
-    // console.log("New Incident ID." + incID);
-    eventType = "New"
+    eventType = 'New';
   }
-
-  // Update the in-memory object
-  incidents[client+incID] = { severity: currentSeverity, status: status, owner: owner, lastSeen: new Date().toISOString() };
+  incidents[client + incID] = {
+    severity: currentSeverity,
+    status,
+    owner,
+    lastSeen: new Date().toISOString()
+  };
   return eventType;
 }
 
+// ---- Defender cell-map helpers --------------------------------------------
+// Fluent DetailsList exposes cells keyed by data-automation-key. Normalize the
+// key so we can match against several column-name variants.
 
-// Whenever the user clicks something, create an observer that will
-// notify background so the notification can be triggered.
-var defaultQueue = function () {
-  var e = document.querySelector(".ext-gridControl-container");
-  if (!e) {
-    //The node we need does not exist yet.
-    //Wait 500ms and try again
-    //window.setTimeout(defaultQueue,500);
-    return;
+function canonical(str) {
+  return String(str ?? '')
+    .replace(/[\uE000-\uF8FF]/g, '')     // strip icon glyphs
+    .replace(/([a-z])([A-Z])/g, '$1 $2') // split camelCase
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '');
+}
+
+function buildCellMap(row) {
+  const map = new Map();
+  const cells = row.querySelectorAll('[data-automationid^="DetailsRowCell"]');
+  for (const cell of cells) {
+    const key = cell.getAttribute('data-automation-key') || cell.dataset?.automationKey;
+    if (!key) continue;
+    map.set(canonical(key), cell);
   }
-  // After selecting the element, disable
+  return map;
+}
+
+function getCell(map, ...keys) {
+  for (const k of keys) {
+    const el = map.get(canonical(k));
+    if (el) return el;
+  }
+  return null;
+}
+
+function getText(map, ...keys) {
+  const el = getCell(map, ...keys);
+  return el ? el.textContent.trim() : '';
+}
+
+// ---- Platform adapters -----------------------------------------------------
+//
+// Adapter interface:
+//   queueRootSelector : string      — for identity/debug
+//   getQueueRoot()    : Element|null
+//   getRows()         : NodeList
+//   beginPass()       : any         — per-mutation context (e.g. header index)
+//   parseRow(rowEl, ctx) : RowInfo|null
+//   removeRow(actionRow) : void
+//   readDetailsBlade() : { element, data } | null
+//   getDisappearanceFallback() : Element|null
+//
+// RowInfo = { severity, title, workspace, incID, numAlerts, status, owner,
+//             tags, actionRow }
+// `actionRow` is the DOM element to feed to `removeRow` — the platform decides
+// what "the row" means for detachment purposes.
+
+const sentinelAdapter = {
+  name: 'sentinel',
+  queueRootSelector: '.ext-gridControl-container',
+
+  getQueueRoot() {
+    return document.querySelector('.ext-gridControl-container');
+  },
+
+  getRows() {
+    return document.querySelectorAll('.fxc-gc-row-content.fxc-gc-row-content_0');
+  },
+
+  beginPass() {
+    // Build a column-name → index map from the current header row.
+    const headers = document.querySelectorAll('.fxc-gc-columnheader-content.fxc-gc-text');
+    const indexes = {};
+    headers.forEach((header, index) => {
+      indexes[header.textContent.trim()] = index;
+    });
+    return { indexes };
+  },
+
+  parseRow(row, ctx) {
+    const { indexes } = ctx;
+    const elements = row.querySelectorAll('[id^="fxc-gc-cell-content"]');
+
+    // Preserve original guard: a row is considered valid only when both
+    // Severity and Title cells are present.
+    if (!elements[indexes['Severity']] || !elements[indexes['Title']]) return null;
+
+    const severity = elements[indexes['Severity']].textContent.trim();
+    const title = elements[indexes['Title']].textContent.trim();
+
+    let workspace = '';
+    if (elements[indexes['Workspace']]) {
+      workspace = elements[indexes['Workspace']].textContent.trim();
+    } else {
+      // Fallback: parse the blade subtitle. (Same behavior as before — will
+      // throw if the subtitle element is missing, matching the original.)
+      workspace = document
+        .querySelector('.fxs-blade-title-subtitleText.msportalfx-tooltip-overflow.fxs-portal-subtext')
+        .textContent.trim();
+      workspace = workspace.match(/'([^']+)'/)[1];
+    }
+
+    const incID = elements[indexes['Incident number']].textContent.trim();
+    const numAlerts = elements[indexes['Alerts']].textContent.trim();
+    const status = elements[indexes['Status']].textContent.trim();
+    const owner = elements[indexes['Owner']].textContent.trim();
+    const tags = elements[indexes['Tags']].textContent.trim();
+    const actionRow = elements[indexes['Owner']].parentNode.parentNode;
+
+    return { severity, title, workspace, incID, numAlerts, status, owner, tags, actionRow };
+  },
+
+  removeRow(actionRow) {
+    if (actionRow?.parentNode) actionRow.parentNode.removeChild(actionRow);
+  },
+
+  readDetailsBlade() {
+    const el = document.querySelector('.ext-details-header-content');
+    if (!el) return null;
+
+    const incNumberMatch = document
+      .querySelector('.msportalfx-font-semibold.ext-details-header-subtitle')
+      ?.textContent.trim().match(/Incident number (\d+)/);
+    const incNumber = incNumberMatch ? incNumberMatch[1] : '';
+    const incTitle = document.querySelector('.ext-details-header-title')?.textContent.trim() || '';
+
+    const items = document.querySelectorAll(
+      '.msportalfx-font-semibold.msportalfx-text-ellipsis.ext-details-header-item-value'
+    );
+    const owner = items[0]?.textContent.trim() || '';
+    const status = items[1]?.textContent.trim() || '';
+    const severity = items[2]?.textContent.trim() || '';
+
+    let workspace = '';
+    let description = '';
+    document.querySelectorAll('.ext-propertyControl-title-container').forEach((container) => {
+      const label = container.textContent.trim();
+      const next = container.nextElementSibling;
+      if (!next) return;
+      if (label.includes('Workspace')) {
+        const m = next.querySelector('article')?.textContent.trim().match(/xdrworkspace-(\w+)/);
+        workspace = m ? m[1] : '';
+      } else if (label.includes('Description')) {
+        description = next.querySelector('article')?.textContent.trim() || '';
+      }
+    });
+
+    if (!incTitle || !incNumber) return null;
+    return {
+      element: el,
+      data: { incTitle, incNumber, owner, status, severity, workspace, description }
+    };
+  },
+
+  getDisappearanceFallback() {
+    return getElementByXpath("//div[@class='ext-gridControl']");
+  }
+};
+
+const defenderAdapter = {
+  name: 'defender',
+  queueRootSelector: '.ms-Viewport',
+
+  getQueueRoot() {
+    return document.querySelector('.ms-Viewport');
+  },
+
+  getRows() {
+    return document.querySelectorAll('.ms-List-cell');
+  },
+
+  beginPass() {
+    return null; // per-row cell map is built inside parseRow
+  },
+
+  parseRow(rowCell) {
+    const cellMap = buildCellMap(rowCell);
+
+    const severityEl = getCell(cellMap, 'severity');
+    const titleEl = getCell(cellMap, 'name', 'incidentName', 'incident name', 'Incident name');
+    if (!severityEl || !titleEl) return null;
+
+    const severity = severityEl.textContent.trim();
+    const title = titleEl.textContent.trim();
+
+    // Defender rows don't currently expose a workspace cell; leave blank so
+    // the shared client-derivation falls back to the raw workspace value.
+    const workspace = getText(cellMap, 'workspace');
+
+    const incID = getText(cellMap, 'incidentId', 'Incident Id', 'IncidentId');
+    const numAlerts = getText(cellMap, 'activeAlerts', 'Active alerts', 'ActiveAlerts');
+    const status = getText(cellMap, 'status');
+    const owner = getText(cellMap, 'assignedTo', 'Assigned to', 'AssignedTo');
+    const tags = getText(cellMap, 'tags');
+
+    // Prefer the owner cell as the anchor for row removal (falls back to title).
+    const anchorCell = getCell(cellMap, 'assignedTo', 'Assigned to', 'AssignedTo') || titleEl;
+    const actionRow = anchorCell?.parentNode?.parentNode || null;
+
+    return { severity, title, workspace, incID, numAlerts, status, owner, tags, actionRow };
+  },
+
+  removeRow(actionRow) {
+    // Defender's grid nests each row two levels deeper than Sentinel's, so
+    // detach at that ancestor instead.
+    const target = actionRow?.parentNode?.parentNode;
+    if (target?.parentNode) target.parentNode.removeChild(target);
+  },
+
+  readDetailsBlade() {
+    // TODO: Defender details-pane selectors aren't wired yet — the previous
+    // WIP file was calling Sentinel selectors here that never resolved.
+    return null;
+  },
+
+  getDisappearanceFallback() {
+    return null;
+  }
+};
+
+const adapter = PLATFORM === 'sentinel'
+  ? sentinelAdapter
+  : PLATFORM === 'defender'
+    ? defenderAdapter
+    : null;
+
+// ---- Shared per-pass row processing ---------------------------------------
+
+function deriveClient(workspace) {
+  const parts = String(workspace ?? '').split('-');
+  return parts.length > 1 ? parts[1].toUpperCase() : workspace;
+}
+
+function processQueue() {
+  if (!adapter) return;
+
+  const ctx = adapter.beginPass();
+  const rows = adapter.getRows();
+  let sendMessage = true;
+
+  rows.forEach((rowEl) => {
+    let info;
+    try {
+      info = adapter.parseRow(rowEl, ctx);
+    } catch (err) {
+      console.log('Row parse failed:', err);
+      return;
+    }
+    if (!info) return;
+
+    const client = deriveClient(info.workspace);
+    const eventType = checkAndUpdateIncident(client, info.incID, info.severity, info.owner, info.status);
+
+    const matches = checkWordAgainstPatterns(info.title, config.filterTitleRegexPatterns)
+      || checkWordAgainstPatterns(info.owner, config.filterOwnerRegexPatterns)
+      || checkTagsAgainstPatterns(info.tags, config.filterTagsRegexPatterns);
+
+    if (matches && doRemoveFromQueue) {
+      adapter.removeRow(info.actionRow);
+    }
+
+    if (!initializing) {
+      const message = {
+        type: 'notification',
+        element: targetElem,
+        info: {
+          element: info.actionRow,
+          severity: info.severity,
+          title: info.title,
+          client,
+          workspace: info.workspace,
+          incID: info.incID,
+          status: info.status,
+          owner: info.owner,
+          eventType,
+          numAlerts: info.numAlerts
+        }
+      };
+
+      if (eventType != 'NONE' && !matches && config.desktopNotifications && sendMessage) {
+        if (config.onlyAlertOnLatest) sendMessage = false;
+        chrome.runtime.sendMessage(message);
+      }
+    }
+  });
+}
+
+function persistDetailsBladeIfChanged() {
+  if (!adapter) return;
+  const result = adapter.readDetailsBlade();
+  if (!result) return;
+
+  detailsElem = result.element;
+  const relevantText = result.data;
+
+  const changed =
+    previousData.incTitle !== relevantText.incTitle
+    || previousData.incNumber !== relevantText.incNumber
+    || previousData.workspace !== relevantText.workspace;
+
+  if (!changed) return;
+
+  chrome.storage.local.set({ relevantText }, () => {
+    console.log('Relevant text updated:', relevantText);
+    previousData = relevantText;
+    chrome.runtime.sendMessage({
+      type: 'set-lastAlertData',
+      element: detailsElem,
+      info: relevantText
+    });
+  });
+}
+
+// ---- Observer wiring -------------------------------------------------------
+
+function defaultQueue() {
+  if (!adapter) return;
+
+  const root = adapter.getQueueRoot();
+  if (!root) return;
+
+  // After selecting the element, disable highlight mode.
   removeListeners();
   enabled = false;
 
   // Only 1 observer supported to start.
   if (observer) {
     observer.disconnect();
-    DOMObserver.disconnect();
-    targetElem.classList.remove(ELEMENT_CHANGED_CLASSNAME);
+    if (DOMObserver) DOMObserver.disconnect();
+    targetElem?.classList.remove(ELEMENT_CHANGED_CLASSNAME);
   }
 
-  targetElem = e;
-  observer = new MutationObserver(function () {
-    // Get the column headers
-    var headers = document.querySelectorAll('.fxc-gc-columnheader-content.fxc-gc-text');
-    // Determine the index of each column
-    var indexes = {};
-    headers.forEach((header, index) => {
-      var columnName = header.textContent.trim();
-      indexes[columnName] = index;
-    });
-    // console.log("****************");
+  targetElem = root;
 
-    // Get all rows in the queue
-    var rows = document.querySelectorAll(".fxc-gc-row-content.fxc-gc-row-content_0")
-    var sendMessage = true
-    rows.forEach((row, index) => {
-      elements = row.querySelectorAll('[id^="fxc-gc-cell-content"]');
-      //console.log(elements.length)
-      if (elements[indexes["Severity"]] && elements[indexes["Title"]]) {
-        var severity = elements[indexes["Severity"]].textContent.trim();
-        var title = elements[indexes["Title"]].textContent.trim();
-        var workspace = "";
-        if (elements[indexes["Workspace"]]) {
-          workspace = elements[indexes["Workspace"]].textContent.trim();
-        } else {
-          workspace = document.querySelector('.fxs-blade-title-subtitleText.msportalfx-tooltip-overflow.fxs-portal-subtext').textContent.trim();
-          workspace = workspace.match(/'([^']+)'/)[1];
-        }
-        var incID = elements[indexes["Incident number"]].textContent.trim();
-        var numAlerts = elements[indexes["Alerts"]].textContent.trim();
-        var status = elements[indexes["Status"]].textContent.trim();
-        var owner = elements[indexes["Owner"]].textContent.trim();
-        var row = elements[indexes["Owner"]].parentNode.parentNode;
-        var tags = elements[indexes["Tags"]].textContent.trim();
-        // Splitting the string on the hyphen
-        var workspaceSplit = workspace.split('-');
-        var client = workspace
-        // Check if the split array has at least two elements
-        if (workspaceSplit.length > 1) {
-          // Set client to the second element of the array, converted to uppercase
-          client = workspaceSplit[1].toUpperCase();
-        } else {
-          // console.log("Split array does not have two elements.");
-        }
-        var eventType = checkAndUpdateIncident(client, incID, severity, owner, status);
-        
-        var incMatchesRegex = checkWordAgainstPatterns(title, config.filterTitleRegexPatterns);
-        var incMatchesRegex = incMatchesRegex ? incMatchesRegex : checkWordAgainstPatterns(owner, config.filterOwnerRegexPatterns)
-        var incMatchesRegex = incMatchesRegex ? incMatchesRegex : checkTagsAgainstPatterns(tags, config.filterTagsRegexPatterns)
-        if (incMatchesRegex && doRemoveFromQueue) {
-          // console.log("Hiding " + client + " " + incID);
-          row.parentNode.removeChild(row);
-        }
-        if (!initializing) {
-          var message = {
-            type: 'notification',
-            element: targetElem,
-            info: {
-              element: row,
-              severity: severity,
-              title: title,
-              client: client,
-              workspace: workspace,
-              incID: incID,
-              status: status,
-              owner: owner,
-              eventType: eventType,
-              numAlerts: numAlerts
-            }
-          };
+  observer = new MutationObserver(() => {
+    processQueue();
 
-          if (eventType != "NONE" && !incMatchesRegex && config.desktopNotifications && sendMessage) {
-            if (config.onlyAlertOnLatest) {
-              sendMessage = false
-            }
-            if (message) {
-              chrome.runtime.sendMessage(message);
-            }
-            //console.log("Sending")
-          } else {
-            //console.log("Not sending");
-          }
-        }
-      } else {
-        console.log("Nothing in Queue");
-      }
-
-    });
-   // console.log(incidents)
-    // Disconnect the observer temporarily so we can set the class name
-    // to avoid triggering and endless loop.
+    // Toggle the "changed" class without re-triggering the observer.
     observer.disconnect();
     targetElem.classList.add(ELEMENT_CHANGED_CLASSNAME);
-    observer.observe(targetElem, { childList: true, subtree: true, characterData: true, attributes: true });
+    observer.observe(targetElem, {
+      childList: true, subtree: true, characterData: true, attributes: true
+    });
+
     if (initializing) {
-      console.log("Finished Initializing")
-      initializing = false
-    }
-    detailsElem = document.querySelector(".ext-details-header-content");
-    console.log(detailsElem);
-    if (detailsElem) {
-      // Extract incident number
-      const incNumberMatch = document.querySelector('.msportalfx-font-semibold.ext-details-header-subtitle')?.textContent.trim().match(/Incident number (\d+)/);
-      const incNumber = incNumberMatch ? incNumberMatch[1] : '';
-
-      // Extract incident title
-      const incTitle = document.querySelector('.ext-details-header-title')?.textContent.trim() || '';
-
-      const ownerElem = document.querySelectorAll('.msportalfx-font-semibold.msportalfx-text-ellipsis.ext-details-header-item-value')[0];
-      const statusElem = document.querySelectorAll('.msportalfx-font-semibold.msportalfx-text-ellipsis.ext-details-header-item-value')[1];
-      const severityElem = document.querySelectorAll('.msportalfx-font-semibold.msportalfx-text-ellipsis.ext-details-header-item-value')[2];
-
-      const owner = ownerElem ? ownerElem.textContent.trim() : '';
-      const status = statusElem ? statusElem.textContent.trim() : '';
-      const severity = severityElem ? severityElem.textContent.trim() : '';
-
-      let workspace = '';
-      let description = '';
-
-      const propertyContainers = document.querySelectorAll('.ext-propertyControl-title-container');
-      propertyContainers.forEach(container => {
-        const title = container.textContent.trim();
-        const nextElement = container.nextElementSibling;
-
-        if (title.includes('Workspace') && nextElement) {
-          const workspaceMatch = nextElement.querySelector('article')?.textContent.trim().match(/xdrworkspace-(\w+)/);
-          workspace = workspaceMatch ? workspaceMatch[1] : '';
-        } else if (title.includes('Description') && nextElement) {
-          description = nextElement.querySelector('article')?.textContent.trim() || '';
-        }
-      });
-
-      const relevantText = { incTitle, incNumber, owner, status, severity, workspace, description };
-
-      // Check if detailsElem exists, incTitle and incNumber are not null or blank, and relevantText has changed
-      if (detailsElem && incTitle && incNumber && 
-        (previousData.incTitle !== incTitle || previousData.incNumber !== incNumber || previousData.workspace !== workspace)) {
-        console.log("Update")
-        // Save the relevant text to Chrome storage
-        chrome.storage.local.set({ relevantText: relevantText }, function() {
-          console.log("Relevant text updated:", relevantText);
-          previousData = relevantText; // Update previousData to the new values
-          var message = {
-            type: 'set-lastAlertData',
-            element: detailsElem,
-            info: relevantText
-          }
-          chrome.runtime.sendMessage(message);
-        });
-      } else {
-        // console.log("Do not update")
-      }
+      console.log('Finished Initializing');
+      initializing = false;
     }
 
-    if (enabled) {
-      setSelectAllVisibility(false);
-    }
-    
+    persistDetailsBladeIfChanged();
+
+    if (enabled) setSelectAllVisibility(false);
   });
 
-  observer.observe(targetElem, { childList: true, subtree: true, characterData: true, attributes: true });
-  
-  
-  DOMObserver = new MutationObserver(function (mutations) {
+  observer.observe(targetElem, {
+    childList: true, subtree: true, characterData: true, attributes: true
+  });
+
+  DOMObserver = new MutationObserver((mutations) => {
     for (const m of mutations) {
-      // A removal happened in the DOM, let's
-      // check if our element was removed.
-      if (m.removedNodes.length > 0) {
+      if (m.removedNodes.length === 0) continue;
+      if (document.body.contains(targetElem)) continue;
 
-        if (!document.body.contains(targetElem)) {
+      chrome.runtime.sendMessage({ type: 'notification', element: targetElem });
+      DOMObserver.disconnect();
 
-          chrome.runtime.sendMessage({ type: 'notification', element: targetElem });
-
-          // Disconnect the DOM observer otherwise we'll get notified
-          // for each change on the DOM.
-          DOMObserver.disconnect()
-
-
-          // highlight it.
-          p = getElementByXpath("//div[@class='ext-gridControl']")
-          p.classList.add(ELEMENT_CHANGED_CLASSNAME);
-        }
-      }
+      const fallback = adapter.getDisappearanceFallback();
+      if (fallback) fallback.classList.add(ELEMENT_CHANGED_CLASSNAME);
+      return;
     }
   });
   DOMObserver.observe(document.body, { childList: true, subtree: true });
 }
 
+// ---- Toggle handler --------------------------------------------------------
 
-var addListeners = function () {
-  document.addEventListener('mousemove', highlightFunc, false);
-  
+function handleToggleFiltering() {
+  if (!adapter) return;
+
+  // Tear down any prior state.
+  if (observer) {
+    observer.disconnect();
+    if (DOMObserver) DOMObserver.disconnect();
+    targetElem?.classList.remove(ELEMENT_CHANGED_CLASSNAME);
+    chrome.runtime.sendMessage({ type: 'set-queue-state', active: false });
+    setSelectAllVisibility(true);
+  }
+
+  if (enabled) {
+    // Turning filtering off.
+    removeListeners();
+  } else {
+    // Turning filtering on.
+    const root = adapter.getQueueRoot();
+    if (!root) return;
+
+    targetElem = root;
+
+    // Initial synchronous pass so filtering takes effect immediately, before
+    // the mutation observer waits for a DOM change.
+    processQueue();
+
+    setSelectAllVisibility(false);
+    targetElem.classList.add(ELEMENT_CHANGED_CLASSNAME);
+    chrome.runtime.sendMessage({ type: 'set-queue-state', active: true });
+
+    if (initializing) {
+      console.log('Finished Initializing');
+      initializing = false;
+    }
+    defaultQueue();
+  }
+
+  enabled = !enabled;
 }
 
-var removeListeners = function () {
-  document.removeEventListener('mousemove', highlightFunc, false);
-  if (prevDOM != null) {
-    prevDOM.classList.remove(MOUSE_VISITED_CLASSNAME);
-  }
-}
+// ---- Portal email extraction (Sentinel only) ------------------------------
 
-// Every time we get a new message toggle the plugin
-chrome.runtime.onMessage.addListener(function (request) {
-  selectMode = false;
-  if (request.type == 'toggle' || request.type == 'toggle-queue-filtering') {
-    // Remove any previous observers listeners if there are any;
-    if (observer) {
-      observer.disconnect();
-      DOMObserver.disconnect();
-      targetElem.classList.remove(ELEMENT_CHANGED_CLASSNAME);
-      chrome.runtime.sendMessage({
-        type: 'set-queue-state',
-        active: false
-      })
-      
-      // Show "Select all items" again when queue filtering is turned off
-      setSelectAllVisibility(true);
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-    }
-    if (enabled) {
-      removeListeners();
-    } else {
-      console.log(selectMode);
-      if (!selectMode) {
-        var e = document.querySelector(".ext-gridControl-container");
-        if (!e) {
-          //The node we need does not exist yet.
-          //Wait 500ms and try again
-          //window.setTimeout(defaultQueue,500);
-          return;
-        }
-        enabled = false;
-        targetElem = e;
-        // Get the column headers
-        var headers = document.querySelectorAll('.fxc-gc-columnheader-content.fxc-gc-text');
-        // Determine the index of each column
-        var indexes = {};
-        headers.forEach((header, index) => {
-          var columnName = header.textContent.trim();
-          indexes[columnName] = index;
-        });
-        console.log("****************");
-
-        // Get all rows in the queue
-        var rows = document.querySelectorAll(".fxc-gc-row-content.fxc-gc-row-content_0")
-        var sendMessage = true
-        rows.forEach((row, index) => {
-          elements = row.querySelectorAll('[id^="fxc-gc-cell-content"]');
-          //console.log(elements.length)
-          if (elements[indexes["Severity"]] && elements[indexes["Title"]]) {
-            var severity = elements[indexes["Severity"]].textContent.trim();
-            var title = elements[indexes["Title"]].textContent.trim();
-            var workspace = "";
-            if (elements[indexes["Workspace"]]) {
-              workspace = elements[indexes["Workspace"]].textContent.trim();
-            } else {
-              workspace = document.querySelector('.fxs-blade-title-subtitleText.msportalfx-tooltip-overflow.fxs-portal-subtext').textContent.trim();
-              workspace = workspace.match(/'([^']+)'/)[1];
-            }
-            var incID = elements[indexes["Incident number"]].textContent.trim();
-            var numAlerts = elements[indexes["Alerts"]].textContent.trim();
-            var status = elements[indexes["Status"]].textContent.trim();
-            var owner = elements[indexes["Owner"]].textContent.trim();
-            var row = elements[indexes["Owner"]].parentNode.parentNode;
-            var tags = elements[indexes["Tags"]].textContent.trim();
-            // Splitting the string on the hyphen
-            var workspaceSplit = workspace.split('-');
-            var client = workspace
-            // Check if the split array has at least two elements
-            if (workspaceSplit.length > 1) {
-              // Set client to the second element of the array, converted to uppercase
-              client = workspaceSplit[1].toUpperCase();
-            } else {
-              console.log("Split array does not have two elements.");
-            }
-            var eventType = checkAndUpdateIncident(client, incID, severity, owner, status);
-            
-            var incMatchesRegex = checkWordAgainstPatterns(title, config.filterTitleRegexPatterns);
-            var incMatchesRegex = incMatchesRegex ? incMatchesRegex : checkWordAgainstPatterns(owner, config.filterOwnerRegexPatterns)
-            var incMatchesRegex = incMatchesRegex ? incMatchesRegex : checkTagsAgainstPatterns(tags, config.filterTagsRegexPatterns)
-            if (incMatchesRegex && doRemoveFromQueue) {
-              console.log("Hiding " + client + " " + incID);
-              row.parentNode.removeChild(row);
-            }
-            if (!initializing) {
-              var message = {
-                type: 'notification',
-                element: targetElem,
-                info: {
-                  element: row,
-                  severity: severity,
-                  title: title,
-                  client: client,
-                  workspace: workspace,
-                  incID: incID,
-                  status: status,
-                  owner: owner,
-                  eventType: eventType,
-                  numAlerts: numAlerts
-                }
-              };
-
-              if (eventType != "NONE" && !incMatchesRegex && config.desktopNotifications && sendMessage) {
-                if (config.onlyAlertOnLatest) {
-                  sendMessage = false
-                }
-                if (message) {
-                  chrome.runtime.sendMessage(message);
-                }
-                //console.log("Sending")
-              } else {
-                //console.log("Not sending");
-              }
-            }
-          } else {
-            console.log("Nothing in Queue");
-          }
-
-        });
-
-        
-        // Hide "Select all items" when queue filtering is enabled
-        setSelectAllVisibility(false);
-
-      // console.log(incidents)
-        // Disconnect the observer temporarily so we can set the class name
-        // to avoid triggering and endless loop.
-        targetElem.classList.add(ELEMENT_CHANGED_CLASSNAME);
-        chrome.runtime.sendMessage({
-          type: 'set-queue-state',
-          active: true
-        })
-        if (initializing) {
-          console.log("Finished Initializing")
-          initializing = false
-        }
-        defaultQueue();
-      } else {
-        addListeners();
-      }
-    }
-    enabled = !enabled;
-  }
-});
-
-// Extract the signed-in Azure portal user's email so the popup's incident
-// lookback tab can pre-fill (and lock) the email field.
 function extractPortalEmail() {
-  const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
   const usernameEl = document.querySelector('.fxs-avatarmenu-username');
   const usernameText = (usernameEl?.textContent || '').trim();
-  if (emailPattern.test(usernameText)) {
-    return usernameText;
-  }
+  if (EMAIL_PATTERN.test(usernameText)) return usernameText;
 
   const buttonEl = document.getElementById('fxs-avatarmenu-button')
     || document.querySelector('.fxs-avatarmenu-header');
@@ -537,26 +581,33 @@ function extractPortalEmail() {
   for (const attr of attrs) {
     if (!attr) continue;
     const match = attr.match(/Email:\s*([^\s<>"']+@[^\s<>"']+)/i);
-    if (match && emailPattern.test(match[1])) {
-      return match[1];
-    }
+    if (match && EMAIL_PATTERN.test(match[1])) return match[1];
   }
-
   return '';
 }
 
-chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
-  if (request?.type !== 'get-portal-email') return;
-  try {
-    const email = extractPortalEmail();
-    if (email) {
-      sendResponse({ ok: true, email });
-    } else {
-      sendResponse({ ok: false, error: 'not-found' });
-    }
-  } catch (err) {
-    sendResponse({ ok: false, error: err?.message || 'unknown' });
-  }
-  return true;
-});
+// ---- Message dispatch ------------------------------------------------------
 
+chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
+  const type = request?.type;
+
+  if (type === 'toggle' || type === 'toggle-queue-filtering') {
+    handleToggleFiltering();
+    return;
+  }
+
+  if (type === 'get-portal-email') {
+    if (PLATFORM !== 'sentinel') {
+      sendResponse({ ok: false, error: 'unsupported-platform' });
+      return true;
+    }
+    try {
+      const email = extractPortalEmail();
+      if (email) sendResponse({ ok: true, email });
+      else sendResponse({ ok: false, error: 'not-found' });
+    } catch (err) {
+      sendResponse({ ok: false, error: err?.message || 'unknown' });
+    }
+    return true;
+  }
+});

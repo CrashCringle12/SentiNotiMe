@@ -60,16 +60,16 @@
   ],
     "content_scripts": [
       {
-        "matches": ["https://portal.azure.com/*", "https://api.abuseipdb.com/*", "https://www.virustotal.com/*", "https://api11.scamalytics.com/*"],
+        "matches": [
+          "https://portal.azure.com/*",
+          "https://mto.security.microsoft.com/*",
+          "https://security.microsoft.com/*",
+          "https://api.abuseipdb.com/*",
+          "https://www.virustotal.com/*",
+          "https://api11.scamalytics.com/*"
+        ],
         "css": ["css/core.css"],
         "js": ["core.js", "scripts/timer-script.js", "scripts/stats.js"],
-        "run_at": "document_end",
-        "all_frames": true
-      },
-      {
-        "matches": ["https://mto.security.microsoft.com/*", "https://security.microsoft.com/*"],
-        "css": ["css/core.css"],
-        "js": ["defender-core.js", "scripts/timer-script.js", "scripts/stats.js"],
         "run_at": "document_end",
         "all_frames": true
       }
