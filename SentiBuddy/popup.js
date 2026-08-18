@@ -322,7 +322,18 @@ async function fetchClientData() {
   
 document.getElementById("searchBox").addEventListener("input", function () {
   const query = this.value.toLowerCase();
-  const filtered = data.filter(item => String(item?.code ?? '').toLowerCase().includes(query));
+  const filtered = data.filter(item => {
+    // Search across multiple fields: code, client, department, lead, edr, contact
+    const searchFields = [
+      String(item?.code ?? ''),
+      String(item?.client ?? ''),
+      String(item?.department ?? ''),
+      String(item?.lead ?? ''),
+      String(item?.edr ?? ''),
+      String(item?.contact ?? '')
+    ];
+    return searchFields.some(field => field.toLowerCase().includes(query));
+  });
   renderTable(filtered);
 });
 
