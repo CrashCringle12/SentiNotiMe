@@ -340,7 +340,17 @@ document.getElementById("searchBox").addEventListener("input", function () {
 
 document.getElementById("devSearchBox").addEventListener("input", function () {
   const query = this.value.toLowerCase();
-  const filtered = devData.filter(item => String(item?.client ?? '').toLowerCase().includes(query));
+  const filtered = devData.filter(item => {
+    // Search across multiple fields: client, sentinelName, rgName, subscriptionName, location
+    const searchFields = [
+      String(item?.client ?? ''),
+      String(item?.sentinelName ?? ''),
+      String(item?.rgName ?? ''),
+      String(item?.subscriptionName ?? ''),
+      String(item?.location ?? '')
+    ];
+    return searchFields.some(field => field.toLowerCase().includes(query));
+  });
   renderDevTable(filtered);
 });
 
